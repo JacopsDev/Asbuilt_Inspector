@@ -23,12 +23,13 @@
 """
 import base64
 import os
+import tempfile
 from collections import Counter, defaultdict
 import re
 from io import BytesIO
 
 from PyQt5.QtCore import Qt, QSizeF, QByteArray, QBuffer, QRect
-from PyQt5.QtGui import QColor, QTextDocument, QPainter, QImage, QIcon
+from PyQt5.QtGui import QColor, QTextDocument, QPainter, QImage, QIcon, QPixmap
 from PyQt5.QtWidgets import QDialog, QVBoxLayout, QTextBrowser, QPushButton, QApplication
 from qgis._core import QgsGeometry, QgsProject, QgsVectorLayer, QgsWkbTypes, QgsFeatureRequest, QgsHtmlAnnotation, \
     QgsPointXY, QgsSymbol, QgsFillSymbol, QgsMapRendererCustomPainterJob, QgsMapSettings
@@ -102,60 +103,74 @@ class AsbuiltInspectorDialog(QgsMapToolEmitPoint):
                     found_features.append((layer.name(), feature.id(), feature, layer))
         return found_features
 
-    def drawpng(self, geom):
+    def save_text_browser_as_png(self):
+        # Grab the widget as a pixmap
+        pixmap = self.browser.grab()
+        # Optional: Save to a file
+        temp_file = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        pixmap.save(temp_file.name, "PNG")
 
-        bbox = geom.boundingBox()
-        rect = QRect(int(bbox.xMinimum()), int(bbox.yMinimum()),
-                     int(bbox.width()), int(bbox.height()))
+        print(f"Saved to: {temp_file.name}")
 
-        # Now crop the canvas pixmap
-        canvas_pixmap = self.iface.mapCanvas().grab()
-        cropped_pixmap = canvas_pixmap.copy(rect)
+        clipboard = QApplication.clipboard()
+        clipboard.setPixmap(pixmap)
 
-        return self.setQbyteArray(cropped_pixmap)
-
-
-    def setQbyteArray(self, img):
-        byte_array = QByteArray()
-        buffer = QBuffer(byte_array)
-        buffer.open(QBuffer.WriteOnly)
-        img.save(buffer, "PNG")
-        buffer.close()
-
-        base64_data= byte_array.toBase64().data().decode()
-        html_img_tag = f"<img src='data:image/png;base64,{base64_data}' style='max-width:100%; border: 1px solid #ccc;' />"
-        return html_img_tag
+    # def drawpng(self, geom):
+    #
+    #     bbox = geom.boundingBox()
+    #     rect = QRect(int(bbox.xMinimum()), int(bbox.yMinimum()),
+    #                  int(bbox.width()), int(bbox.height()))
+    #
+    #     # Now crop the canvas pixmap
+    #     canvas_pixmap = self.iface.mapCanvas().grab()
+    #     cropped_pixmap = canvas_pixmap.copy(rect)
+    #
+    #     return self.setQbyteArray(cropped_pixmap)
+    #
+    #
+    # def setQbyteArray(self, img):
+    #     byte_array = QByteArray()
+    #     buffer = QBuffer(byte_array)
+    #     buffer.open(QBuffer.WriteOnly)
+    #     img.save(buffer, "PNG")
+    #     buffer.close()
+    #
+    #     base64_data= byte_array.toBase64().data().decode()
+    #     html_img_tag = f"<img src='data:image/png;base64,{base64_data}' style='max-width:100%; border: 1px solid #ccc;' />"
+    #     return html_img_tag
 
     def reset(self):
         self.points = []
         self.rubberBand.reset(QgsWkbTypes.PolygonGeometry)
 
-    def copy_text(self):
-        result = self.browser.toPlainText()
 
-
-    def render_polygon_image(polygon_feature, layer):
-        pass
 
     def show_feature_dialog(self, found, geom):
         if not found:
             return
 
         dialog = QDialog(self.parent)
-        dialog.setWindowTitle("Found Features")
-        dialog.resize(400, 600)  # Optional initial size
+        dialog.setWindowTitle("SABINE")
+        dialog.resize(300, 550)  # Optional initial size
         dialog.setSizeGripEnabled(True)  # Allows user resizing
         layout = QVBoxLayout(dialog)
 
-        browser = QTextBrowser(dialog)
-        browser.setTextInteractionFlags(Qt.TextSelectableByKeyboard | Qt.TextSelectableByMouse)
-        layout.addWidget(browser)
+        self.browser = QTextBrowser(dialog)
+        self.browser.setTextInteractionFlags(Qt.TextSelectableByKeyboard | Qt.TextSelectableByMouse)
+        layout.addWidget(self.browser)
+
         copy_button = QPushButton("Copy Text", dialog)
         plugin_dir = os.path.dirname(os.path.abspath(__file__))
-        icon_path = os.path.join(plugin_dir,
+        icon_pathp = os.path.join(plugin_dir,
                                  'paste.png')
+
+        plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        icon_path = os.path.join(plugin_dir,
+                                 'water-color.png')
         icon = QIcon(icon_path)
-        copy_button.setIcon(icon)
+        dialog.setWindowIcon(icon)
+        iconc = QIcon(icon_pathp)
+        copy_button.setIcon(iconc)
 
         self.icon_inactive = QIcon(icon_path)
         layout.addWidget(copy_button)
@@ -168,7 +183,7 @@ class AsbuiltInspectorDialog(QgsMapToolEmitPoint):
             grouped[group_key]["layers"].add(layer_name)
 
         html = """
-        <h2 style="color:#2c3e50; margin-bottom: 10px;">Selected Features</h2>
+        <h2 style="color:#2c3e50; margin-bottom: 10px;">Selected Features through all layers </h2>
         <ul style="padding-left: 20px;">
         """
         plain_text = "Selected Features\n"
@@ -192,11 +207,11 @@ class AsbuiltInspectorDialog(QgsMapToolEmitPoint):
                             if val is not None and str(val).replace(".", "", 1).isdigit():
                                 field_counter[fname] = field_counter.get(fname, 0) + float(val)
 
-                html += "<div style='margin-left:10px;'><b>Crossing Fields:</b><ul style='margin-top: 4px;'>"
+                html += "<div style='margin-left:10px;'><ul style='margin-top: 4px;'>"
                 plain_text += "Crossing Fields:\n"
                 for field_name, total in field_counter.items():
                     if total > 0:
-                        html += f"<li>{field_name}: <span style='color:#27ae60;'>{total}</span></li>"
+                        html += f"<li><b>{field_name}:</b> <span style='color:#27ae60;'>{total}</span></li>"
                         plain_text += f"{field_name}: {total}\n"
                 html += "</ul><br>"
 
@@ -213,11 +228,11 @@ class AsbuiltInspectorDialog(QgsMapToolEmitPoint):
                             if val is not None and str(val).replace(".", "", 1).isdigit():
                                 field_counter[fname] = field_counter.get(fname, 0) + float(val)
 
-                html += "<div style='margin-left:10px;'><b>Trenching Fields:</b><ul style='margin-top: 4px;'>"
-                plain_text += "Trenching Fields:\n"
+                html += "<div style='margin-left:10px;'><ul style='margin-top: 4px;'>"
+
                 for field_name, total in field_counter.items():
                     if total > 0:
-                        html += f"<li>{field_name}: {total}</li>"
+                        html += f"<li><b>{field_name}:</b> <span style='color:#27ae60;'>{total}</span></li>"
                         plain_text += f"{field_name}: {total}\n"
                 html += "</ul><br>"
 
@@ -232,22 +247,23 @@ class AsbuiltInspectorDialog(QgsMapToolEmitPoint):
                                 materiaal_counter[str(val).strip()] += 1
 
                 if materiaal_counter:
-                    html += "<div style='margin-left:10px;'><b>Trenching Fields:</b><ul style='margin-bottom:10px;'>"
-                    plain_text += "materiaal:\n"
+                    html += "<div style='margin-left:10px;'><ul style='margin-bottom:10px;'>"
                     for mat_val, count in materiaal_counter.items():
-                        html += f"<li>{mat_val} (×{count})</li>"
+                        html += f"<li><b>{mat_val}</b> <span style='color:#27ae60;'> (×{count})</span></li>"
                         plain_text += f"{mat_val} (×{count})\n"
                     html += "</ul>"
 
             html += "</div></li>"
 
-        html_img_tg = self.drawpng(geom)
-        html += f"""
-        <h3 style="margin-top:20px;">Captured Area</h3>
-        {html_img_tg}
-        """
+        # html_img_tg = self.drawpng(geom)
+        # html += f"""
+        # <h3 style="margin-top:20px;">Captured Area</h3>
+        # {html_img_tg}
+        # """
 
-        browser.setHtml(html)
+
+        self.browser.setHtml(html)
+        self.save_text_browser_as_png()
 
         def copy_text():
             QApplication.clipboard().setText(plain_text)
