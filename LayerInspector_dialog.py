@@ -62,6 +62,7 @@ class AsbuiltInspectorDialog(QgsMapToolEmitPoint):
         self.found = []
 
 
+
     def canvasPressEvent(self, event):
         if event.button() == Qt.LeftButton:
             point = self.canvas.getCoordinateTransform().toMapCoordinates(event.pos())
@@ -139,11 +140,21 @@ class AsbuiltInspectorDialog(QgsMapToolEmitPoint):
     #     html_img_tag = f"<img src='data:image/png;base64,{base64_data}' style='max-width:100%; border: 1px solid #ccc;' />"
     #     return html_img_tag
 
+
+
     def reset(self):
         self.points = []
         self.rubberBand.reset(QgsWkbTypes.PolygonGeometry)
 
+    def get_base_table_name(layer):
+        uri = layer.dataProvider().dataSourceUri()
+        match = re.search(r'table="(?:[^"]+\.)?([^"]+)"', uri)
+        if match:
+            return match.group(1).lower()
+        return None
 
+    def copy_text(txt):
+        QApplication.clipboard().setText(txt)
 
     def show_feature_dialog(self, found, geom):
         if not found:
@@ -159,7 +170,8 @@ class AsbuiltInspectorDialog(QgsMapToolEmitPoint):
         self.browser.setTextInteractionFlags(Qt.TextSelectableByKeyboard | Qt.TextSelectableByMouse)
         layout.addWidget(self.browser)
 
-        copy_button = QPushButton("Copy Text", dialog)
+        self.copy_button = QPushButton("Copy Text", dialog)
+
         plugin_dir = os.path.dirname(os.path.abspath(__file__))
         icon_pathp = os.path.join(plugin_dir,
                                  'paste.png')
@@ -170,15 +182,28 @@ class AsbuiltInspectorDialog(QgsMapToolEmitPoint):
         icon = QIcon(icon_path)
         dialog.setWindowIcon(icon)
         iconc = QIcon(icon_pathp)
-        copy_button.setIcon(iconc)
+        self.copy_button.setIcon(iconc)
 
         self.icon_inactive = QIcon(icon_path)
-        layout.addWidget(copy_button)
+        layout.addWidget(self.copy_button)
+
+        def get_base_table_name(layer):
+            uri = layer.dataProvider().dataSourceUri()
+            match = re.search(r'table="[^"]+"\."([^"]+)"', uri)
+            if match:
+                return match.group(1).lower()
+            return "other"
 
         grouped = defaultdict(lambda: {"features": [], "layers": set()})
         for layer_name, fid, feature, layer in found:
-            base_name = re.split(r'[_\s]', layer_name.lower())[0].rstrip("s")
-            group_key = base_name if base_name in ["accesspoint", "crossing", "trenching"] else base_name
+            db_table = get_base_table_name(layer)
+            mapping = {
+                "accesspoints": "accesspoint",
+                "crossings": "crossing",
+                "trenching": "trenching"
+            }
+            group_key = mapping.get(db_table, "other")
+
             grouped[group_key]["features"].append((feature, layer))
             grouped[group_key]["layers"].add(layer_name)
 
@@ -195,80 +220,108 @@ class AsbuiltInspectorDialog(QgsMapToolEmitPoint):
             plain_text += f"{group_name.capitalize()} – {len(features)} features\n"
 
             if group_name == "crossing":
-                crossing_field_prefixes = ["db24", "db3", "db5", "db7", "db20", "db14", "wachtbuis", "pe", "db7_gr",
-                                           "d7_or"]
-                field_counter = {}
+                crossing_field_prefixes = ["db24", "db3_14", "db5_14", "db7_14", "db3_20", "db14", "wachtbuis", "pe",
+                                           "db7_gr", "d7_or"]
+
+                field_counter = {}  # Total installed length
+                field_feature_count = {}  # How many features contribute to this field
+                total_length = 0
 
                 for feature, layer in features:
-                    for field in layer.fields():
-                        fname = field.name()
-                        if any(fname.startswith(prefix) for prefix in crossing_field_prefixes):
-                            val = feature[fname]
-                            if val is not None and str(val).replace(".", "", 1).isdigit():
-                                field_counter[fname] = field_counter.get(fname, 0) + float(val)
+                    geom = feature.geometry()
+                    if geom and geom.isGeosValid():
+                        geom_length = geom.length()
+                        total_length += geom_length
 
+                        for field in layer.fields():
+                            fname = field.name()
+                            if any(fname.startswith(prefix) for prefix in crossing_field_prefixes):
+                                val = feature[fname]
+                                if val is not None and str(val).replace(".", "", 1).isdigit():
+                                    val_float = float(val)
+                                    total_field_length = val_float * geom_length
+                                    # Accumulate total installed length
+                                    field_counter[fname] = field_counter.get(fname, 0) + total_field_length
+                                    # Count how many features had this field > 0
+                                    if val_float > 0:
+                                        field_feature_count[fname] = field_feature_count.get(fname, 0) + 1
+
+
+                # Per-field breakdown
                 html += "<div style='margin-left:10px;'><ul style='margin-top: 4px;'>"
-                plain_text += "Crossing Fields:\n"
-                for field_name, total in field_counter.items():
-                    if total > 0:
-                        html += f"<li><b>{field_name}:</b> <span style='color:#27ae60;'>{total}</span></li>"
-                        plain_text += f"{field_name}: {total}\n"
+                plain_text += "Field totals:\n"
+
+                for field_name in sorted(field_counter):
+                    total_installed = round(field_counter[field_name], 2)
+                    count = field_feature_count.get(field_name, 0)
+                    if count != 0:
+                        html += f"<li><b>{field_name}</b><span style='color:#2596be'> ({count}x)</span> <span style='color:#27ae60;'> {total_installed}m</span></li>"
+                        plain_text += f"{field_name}: {count}× totaling {total_installed} m\n"
                 html += "</ul><br>"
+
+
 
             elif group_name == "trenching":
-                trench_field_prefixes = ["db24", "db3", "db5", "db7", "db20", "db14", "wachtbuis", "pe", "db7_gr",
-                                         "d7_or", "srv", "hdpe"]
-                field_counter = {}
 
+                trench_field_prefixes = ["db24", "db3_14", "db5_14", "db7_14", "db3_20", "db14", "wachtbuis", "pe",
+
+                                         "db7_gr", "d7_or", "srv", "hdpe"]
+
+                field_counter = {}  # Total installed length per field
+                field_feature_count = {}  # Number of features contributing per field
+                total_length = 0  # Total geometry length of trenching
                 for feature, layer in features:
-                    for field in layer.fields():
-                        fname = field.name()
-                        if any(fname.startswith(prefix) for prefix in trench_field_prefixes):
-                            val = feature[fname]
-                            if val is not None and str(val).replace(".", "", 1).isdigit():
-                                field_counter[fname] = field_counter.get(fname, 0) + float(val)
+                    geom = feature.geometry()
+                    if geom and geom.isGeosValid():
+                        geom_length = geom.length()
+                        total_length += geom_length
+                        for field in layer.fields():
+                            fname = field.name()
+                            if any(fname.startswith(prefix) for prefix in trench_field_prefixes):
+                                val = feature[fname]
+                                if val is not None and str(val).replace(".", "", 1).isdigit():
+                                    val_float = float(val)
+                                    total_field_length = val_float * geom_length
+                                    field_counter[fname] = field_counter.get(fname, 0) + total_field_length
+                                    if val_float > 0:
+                                        field_feature_count[fname] = field_feature_count.get(fname, 0) + 1
+
+                plain_text += f"Total Length: {round(total_length, 2)} m\n"
 
                 html += "<div style='margin-left:10px;'><ul style='margin-top: 4px;'>"
+                plain_text += "Field totals:\n"
 
-                for field_name, total in field_counter.items():
-                    if total > 0:
-                        html += f"<li><b>{field_name}:</b> <span style='color:#27ae60;'>{total}</span></li>"
-                        plain_text += f"{field_name}: {total}\n"
+                for field_name in sorted(field_counter):
+                    total_installed = round(field_counter[field_name], 2)
+                    count = field_feature_count.get(field_name, 0)
+                    if count != 0:
+                        html += f"<li><b>{field_name}</b><span style='color:#2596be;'> ({count}x)</span> <span style='color:#27ae60;'> {total_installed}m</span></li>"
+                        plain_text += f"{field_name}: {count}× totaling {total_installed} m\n"
                 html += "</ul><br>"
 
-            else:  # Accesspoint or others
+            elif group_name == "accesspoint":
                 materiaal_counter = Counter()
+
                 for feature, layer in features:
                     for field in layer.fields():
-                        fname = field.name()
-                        if fname == "materiaal" or fname.startswith("materiaal_"):
+                        fname = field.name().lower()
+                        if "materiaal" in fname:  # Adjust based on actual field names
                             val = feature[fname]
-                            if val and str(val).strip().upper() != "NULL":
-                                materiaal_counter[str(val).strip()] += 1
+                            if val:
+                                materiaal_counter[str(val)] += 1
 
                 if materiaal_counter:
-                    html += "<div style='margin-left:10px;'><ul style='margin-bottom:10px;'>"
+                    html += "<div style='margin-left:10px;'><b>Les matériaux:</b><ul style='margin-bottom:10px;'>"
                     for mat_val, count in materiaal_counter.items():
-                        html += f"<li><b>{mat_val}</b> <span style='color:#27ae60;'> (×{count})</span></li>"
+                        html += f"<li><b>{mat_val}</b> (<span style='color:#27ae60;'>×{count}</span>)</li>"
                         plain_text += f"{mat_val} (×{count})\n"
-                    html += "</ul>"
-
-            html += "</div></li>"
-
-        # html_img_tg = self.drawpng(geom)
-        # html += f"""
-        # <h3 style="margin-top:20px;">Captured Area</h3>
-        # {html_img_tg}
-        # """
-
-
+                    html += "</ul></div>"
         self.browser.setHtml(html)
         self.save_text_browser_as_png()
+        self.copy_button.clicked.connect(self.copy_text)
 
-        def copy_text():
-            QApplication.clipboard().setText(plain_text)
 
-        copy_button.clicked.connect(copy_text)
+
 
         dialog.setLayout(layout)
         dialog.exec_()
