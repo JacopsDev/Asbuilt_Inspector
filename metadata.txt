@@ -6,7 +6,7 @@
 name=AsbuiltInspector
 qgisMinimumVersion=3.0
 description=an efficient tool for Unifiber
-version=0.1
+version=1.1.1
 author=Jacops
 email=toon.vandevoorde@jacops.be
 
