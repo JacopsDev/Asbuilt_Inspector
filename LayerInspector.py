@@ -174,12 +174,13 @@ class AsbuiltInspector:
         self.inspect_action.triggered.connect(self.run)
         self.inspect_action.setCheckable(True)  # optional toggle-style look
 
+
         # Add to toolbar and menu
         self.iface.addToolBarIcon(self.inspect_action)
         self.iface.addPluginToMenu(self.menu, self.inspect_action)
 
         self.actions.append(self.inspect_action)
-        self.first_start = True
+
 
     def unload(self):
         """Removes the plugin menu item and icon from QGIS GUI."""
@@ -202,6 +203,7 @@ class AsbuiltInspector:
             self.inspect_action.setIcon(self.icon_active)
             self.inspect_action.setChecked(True)
             self.tool_active = True
+
         else:
             canvas.unsetMapTool(self.dlg)
             self.inspect_action.setIcon(self.icon_inactive)

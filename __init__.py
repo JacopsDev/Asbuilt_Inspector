@@ -33,4 +33,5 @@ def classFactory(iface):  # pylint: disable=invalid-name
     """
     #
     from .LayerInspector import AsbuiltInspector
+
     return AsbuiltInspector(iface)

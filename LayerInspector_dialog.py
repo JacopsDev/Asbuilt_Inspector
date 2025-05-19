@@ -28,11 +28,14 @@ from collections import Counter, defaultdict
 import re
 from io import BytesIO
 
+import re
+from collections import defaultdict, Counter
+
 from PyQt5.QtCore import Qt, QSizeF, QByteArray, QBuffer, QRect
 from PyQt5.QtGui import QColor, QTextDocument, QPainter, QImage, QIcon, QPixmap
-from PyQt5.QtWidgets import QDialog, QVBoxLayout, QTextBrowser, QPushButton, QApplication
+from PyQt5.QtWidgets import QDialog, QVBoxLayout, QTextBrowser, QPushButton, QApplication, QSizePolicy
 from qgis._core import QgsGeometry, QgsProject, QgsVectorLayer, QgsWkbTypes, QgsFeatureRequest, QgsHtmlAnnotation, \
-    QgsPointXY, QgsSymbol, QgsFillSymbol, QgsMapRendererCustomPainterJob, QgsMapSettings
+    QgsPointXY, QgsSymbol, QgsFillSymbol, QgsMapRendererCustomPainterJob, QgsMapSettings, Qgis
 from qgis._gui import QgsMapToolEmitPoint, QgsRubberBand, QgsMapCanvasAnnotationItem
 from qgis.gui import QgsMapToolIdentifyFeature
 from qgis.PyQt import uic
@@ -43,6 +46,177 @@ from qgis.PyQt import QtWidgets
 #     os.path.dirname(__file__), 'LayerInspector_dialog_base.ui'))
 # class AsbuiltInspectorDialog(QtWidgets.QDialog, FORM_CLASS):
 
+class FeatureSummarizer:
+    CROSSING_PREFIXES = ["db24", "db3_14", "db5_14", "db7_14", "db3_20", "db14", "wachtbuis", "pe", "db7_gr", "d7_or"]
+    TRENCHING_PREFIXES = ["db24", "db3_14", "db5_14", "db7_14", "db3_20", "db14", "wachtbuis", "pe", "db7_gr", "db7_or", "srv", "hdpe"]
+
+    TYPE_MAPPING = {
+        "accesspoints": "accesspoint",
+        "crossing": "crossing",
+        "trenching": "trenching",
+    }
+
+    @staticmethod
+    def parse_db_and_table(layer):
+        uri = layer.dataProvider().dataSourceUri()
+        db_match = re.search(r"dbname='([^']+)'", uri)
+        dbname = db_match.group(1).lower() if db_match else "other"
+        table_match = (
+            re.search(r'table="[^"]+"\."([^"]+)"', uri) or
+            re.search(r'table="([^"]+)"', uri) or
+            re.search(r'table=([^ ]+)', uri)
+        )
+        table_name = table_match.group(1).lower() if table_match else "other"
+        return dbname, table_name
+
+    @classmethod
+    def determine_group_key(cls, feature, layer):
+        dbname, table_name = cls.parse_db_and_table(layer)
+        if dbname == "wyre":
+            db_group = "wyre"
+        elif dbname == "fiberklaar":
+            project_val = (str(feature["project"]).lower() if "project" in feature.fields().names() else "")
+            db_group = "wyre" if "wyre" in project_val else "fiberklaar"
+        else:
+            db_group = "other"
+        type_key = cls.TYPE_MAPPING.get(table_name, "other")
+        return f"{db_group}_{type_key}"
+
+    @classmethod
+    def accumulate_length(cls, features, prefixes):
+        field_total = {}
+        feature_count = {}
+        total_len = 0
+        for feat, lyr in features:
+            geom = feat.geometry()
+            if not geom or not geom.isGeosValid():
+                continue
+            g_len = geom.length()
+            total_len += g_len
+            for fld in lyr.fields():
+                fname = fld.name()
+                if any(fname.startswith(p) for p in prefixes):
+                    val = feat[fname]
+                    if val is None or not str(val).replace(".", "", 1).isdigit():
+                        continue
+                    val_f = float(val)
+                    field_total[fname] = field_total.get(fname, 0) + val_f * g_len
+                    if val_f > 0:
+                        feature_count[fname] = feature_count.get(fname, 0) + 1
+        return field_total, feature_count, total_len
+
+    @staticmethod
+    def render_length_summary(field_total, feature_count, header=""):
+        text = ""
+        html = "<div style='margin-left:10px;'><ul style='margin-top:4px;'>"
+        for fname in sorted(field_total):
+            installed = round(field_total[fname], 2)
+            cnt = feature_count.get(fname, 0)
+            if cnt == 0:
+                continue  # Skip if the count is 0
+            html += (
+                f"<li><b>{fname}</b>"
+                f"<span style='color:#2596be'> ({cnt}x)</span> "
+                f"<span style='color:#27ae60;'> ➔  {installed}m</span></li>"
+            )
+            text += f"{fname}: (x{cnt}) ➔ {installed} m\n"
+        html += "</ul><br>"
+        return html, text
+
+    @classmethod
+    def summarize_crossings(cls, features, group_name):
+        field_counter, feature_counter, length = cls.accumulate_length(features, cls.CROSSING_PREFIXES)
+        header = f"{group_name} - Total Length: {round(length, 2)} m\n"
+        return cls.render_length_summary(field_counter, feature_counter, header=header)
+
+    @classmethod
+    def summarize_trenching(cls, features, group_name):
+        field_counter, feature_counter, length = cls.accumulate_length(features, cls.TRENCHING_PREFIXES)
+        header = f"{group_name} - Total Length: {round(length, 2)} m\n"
+        return cls.render_length_summary(field_counter, feature_counter, header=header)
+
+    @staticmethod
+    def summarize_accesspoints(features):
+        materiaal_counter = Counter()
+        for feat, lyr in features:
+            for fld in lyr.fields():
+                if "materiaal" in fld.name().lower():
+                    val = feat[fld.name()]
+                    if val:
+                        materiaal_counter[str(val)] += 1
+        html = "<div style='margin-left:10px;'></b><ul style='margin-bottom:10px;'>"
+        text = ""
+        for mat, cnt in materiaal_counter.items():
+            html += f"<li><b>{mat}</b> (<span style='color:#27ae60;'>×{cnt}</span>)</li>"
+            text += f"{mat} (×{cnt})\n"
+        html += "</ul></div>"
+        return html, text
+
+    @classmethod
+    def generate_summary(cls, found):
+        grouped_by_db = defaultdict(lambda: defaultdict(list))
+
+        for layer_name, fid, feature, layer in found:
+            key = cls.determine_group_key(feature, layer)
+            db_group, type_key = key.split("_", 1)
+            grouped_by_db[db_group][type_key].append((feature, layer))
+
+        html = ""
+        text = ""
+
+        for db_group, type_dict in grouped_by_db.items():
+            if db_group.lower() == "wyre":
+                header_color = "#27ae60"
+                plugin_dir = os.path.dirname(os.path.abspath(__file__))
+                icon_path = os.path.join(plugin_dir,
+                                         'wyrewyre.png')
+                icon_url = icon_path
+            elif db_group.lower() == "fiberklaar":
+                header_color = "#2980b9"  # Blue
+                plugin_dir = os.path.dirname(os.path.abspath(__file__))
+                icon_path = os.path.join(plugin_dir,
+                                         'fiberfiber.png')
+                icon_url = icon_path
+            else:
+                header_color = "#2c3e50"
+                icon_url = ""  # Optional default or empty
+
+            # Include image next to the title if available
+            img_tag = f"<img src='{icon_url}' style='height:20px; width:40px; vertical-align:middle; margin-right:10px; border-radius:4px;' />" if icon_url else ""
+
+            html += f"<h2 style='color:{header_color}; margin-top:20px; height:20px; width:40px;'>{img_tag}</h2>"
+            text += f"{db_group.upper()}:\n{'=' * (len(db_group) + 1)}\n"
+
+            # ACCESSPOINTS
+            if "accesspoint" in type_dict:
+                h, t = cls.summarize_accesspoints(type_dict["accesspoint"])
+                html += f"<h3 style='text-decoration: underline; margin-left:5px'>⛘  Accespoints materiaal</h3>{h}"
+                text += f"Accespoints materiaal:\n{t}\n"
+
+
+            # CROSSINGS
+            if "crossing" in type_dict:
+                h, t = cls.summarize_crossings(type_dict["crossing"], f"{db_group} - Crossing")
+                html += f"<h3 style='text-decoration: underline; margin-left:5px'>&#x26D9;   Crossings</h3>"
+                html += f"<div style='margin-left:10px;'><b> Total Crossing Length:</b> {round(cls.accumulate_length(type_dict['crossing'], cls.CROSSING_PREFIXES)[2], 2)} m</div>"
+                html += h
+                text += f"Total Crossing Length : {round(cls.accumulate_length(type_dict['crossing'], cls.CROSSING_PREFIXES)[2], 2)} " + "\n"
+                text += f"Crossings:\n{t}\n"
+
+
+            # TRENCHING
+            if "trenching" in type_dict:
+                h, t = cls.summarize_trenching(type_dict["trenching"], f"{db_group} - Trenching")
+                html += f"<h3 style='text-decoration: underline; margin-left:5px'>☵  Trenching</h3>"
+                html += f"<div style='margin-left:10px;'><b> Total Trenching Length:</b> {round(cls.accumulate_length(type_dict['trenching'], cls.TRENCHING_PREFIXES)[2], 2)}m</div>"
+                html += h
+                text += f"Total Trenching Length : {round(cls.accumulate_length(type_dict['trenching'], cls.TRENCHING_PREFIXES)[2], 2)} \n"
+                text += f"Trenching:\n{t}\n"
+
+            html += "<hr>"
+            text += "_" * 40 + "\n"
+
+        return html, text, grouped_by_db
 
 class AsbuiltInspectorDialog(QgsMapToolEmitPoint):
     def __init__(self, iface, parent=None):
@@ -53,15 +227,16 @@ class AsbuiltInspectorDialog(QgsMapToolEmitPoint):
         self.browser = None
         self.html_img_tag = None
 
+
         self.canvas = iface.mapCanvas()
         self.rubberBand = QgsRubberBand(self.canvas, QgsWkbTypes.PolygonGeometry)
         self.rubberBand.setColor(QColor(255, 0, 0, 100))
         self.rubberBand.setWidth(2)
         self.points = []
-
         self.found = []
 
-
+        self.iface.messageBar().pushMessage(f" &#128433; Use your left mouse-button to start drawing a polygon <br> 🇫🇷 Utilisez le bouton gauche de la souris pour commencer à dessiner un polygone",
+                                        level=Qgis.Info)
 
     def canvasPressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -98,10 +273,20 @@ class AsbuiltInspectorDialog(QgsMapToolEmitPoint):
             if layer.geometryType() == QgsWkbTypes.NoGeometry:
                 continue
 
+            # Optional: deselect all first
+            layer.removeSelection()
+
+            selected_ids = []
             request = QgsFeatureRequest().setFilterRect(geometry.boundingBox())
             for feature in layer.getFeatures(request):
                 if geometry.intersects(feature.geometry()):
                     found_features.append((layer.name(), feature.id(), feature, layer))
+                    selected_ids.append(feature.id())
+
+            # Highlight (select) the features
+            if selected_ids:
+                layer.selectByIds(selected_ids)
+
         return found_features
 
     def save_text_browser_as_png(self):
@@ -116,42 +301,12 @@ class AsbuiltInspectorDialog(QgsMapToolEmitPoint):
         clipboard = QApplication.clipboard()
         clipboard.setPixmap(pixmap)
 
-    # def drawpng(self, geom):
-    #
-    #     bbox = geom.boundingBox()
-    #     rect = QRect(int(bbox.xMinimum()), int(bbox.yMinimum()),
-    #                  int(bbox.width()), int(bbox.height()))
-    #
-    #     # Now crop the canvas pixmap
-    #     canvas_pixmap = self.iface.mapCanvas().grab()
-    #     cropped_pixmap = canvas_pixmap.copy(rect)
-    #
-    #     return self.setQbyteArray(cropped_pixmap)
-    #
-    #
-    # def setQbyteArray(self, img):
-    #     byte_array = QByteArray()
-    #     buffer = QBuffer(byte_array)
-    #     buffer.open(QBuffer.WriteOnly)
-    #     img.save(buffer, "PNG")
-    #     buffer.close()
-    #
-    #     base64_data= byte_array.toBase64().data().decode()
-    #     html_img_tag = f"<img src='data:image/png;base64,{base64_data}' style='max-width:100%; border: 1px solid #ccc;' />"
-    #     return html_img_tag
-
 
 
     def reset(self):
         self.points = []
         self.rubberBand.reset(QgsWkbTypes.PolygonGeometry)
 
-    def get_base_table_name(layer):
-        uri = layer.dataProvider().dataSourceUri()
-        match = re.search(r'table="(?:[^"]+\.)?([^"]+)"', uri)
-        if match:
-            return match.group(1).lower()
-        return None
 
     def copy_text(txt):
         QApplication.clipboard().setText(txt)
@@ -162,168 +317,61 @@ class AsbuiltInspectorDialog(QgsMapToolEmitPoint):
 
         dialog = QDialog(self.parent)
         dialog.setWindowTitle("SABINE")
-        dialog.resize(300, 550)  # Optional initial size
-        dialog.setSizeGripEnabled(True)  # Allows user resizing
+        dialog.resize(300, 600)
+        dialog.setSizeGripEnabled(True)
         layout = QVBoxLayout(dialog)
 
         self.browser = QTextBrowser(dialog)
         self.browser.setTextInteractionFlags(Qt.TextSelectableByKeyboard | Qt.TextSelectableByMouse)
         layout.addWidget(self.browser)
 
+        # Generate summary HTML and plain text using helper class
+        summarizer = FeatureSummarizer()
+        html, plain_text, grouped = summarizer.generate_summary(found)
+
+        self.browser.setHtml(html)
+
+
         self.copy_button = QPushButton("Copy Text", dialog)
+        self.copy_button.setCursor(Qt.PointingHandCursor)
 
         plugin_dir = os.path.dirname(os.path.abspath(__file__))
-        icon_pathp = os.path.join(plugin_dir,
-                                 'paste.png')
-
-        plugin_dir = os.path.dirname(os.path.abspath(__file__))
-        icon_path = os.path.join(plugin_dir,
-                                 'water-color.png')
+        icon_pathp = os.path.join(plugin_dir, 'paste.png')
+        icon_path = os.path.join(plugin_dir, 'water-color.png')
         icon = QIcon(icon_path)
         dialog.setWindowIcon(icon)
         iconc = QIcon(icon_pathp)
         self.copy_button.setIcon(iconc)
 
-        self.icon_inactive = QIcon(icon_path)
         layout.addWidget(self.copy_button)
-
-        def get_base_table_name(layer):
-            uri = layer.dataProvider().dataSourceUri()
-            match = re.search(r'table="[^"]+"\."([^"]+)"', uri)
-            if match:
-                return match.group(1).lower()
-            return "other"
-
-        grouped = defaultdict(lambda: {"features": [], "layers": set()})
-        for layer_name, fid, feature, layer in found:
-            db_table = get_base_table_name(layer)
-            mapping = {
-                "accesspoints": "accesspoint",
-                "crossings": "crossing",
-                "trenching": "trenching"
-            }
-            group_key = mapping.get(db_table, "other")
-
-            grouped[group_key]["features"].append((feature, layer))
-            grouped[group_key]["layers"].add(layer_name)
-
-        html = """
-        <h2 style="color:#2c3e50; margin-bottom: 10px;">Selected Features through all layers </h2>
-        <ul style="padding-left: 20px;">
-        """
-        plain_text = "Selected Features\n"
-
-        for group_name, data in grouped.items():
-            features = data["features"]
-            html += f"<li><span style='font-weight:bold; color:#2980b9;'>{group_name}</span> – {len(features)} features"
-            html += "<div style='margin-top: 5px;margin-bottom:5px; margin-left: 10px;'>"
-            plain_text += f"{group_name.capitalize()} – {len(features)} features\n"
-
-            if group_name == "crossing":
-                crossing_field_prefixes = ["db24", "db3_14", "db5_14", "db7_14", "db3_20", "db14", "wachtbuis", "pe",
-                                           "db7_gr", "d7_or"]
-
-                field_counter = {}  # Total installed length
-                field_feature_count = {}  # How many features contribute to this field
-                total_length = 0
-
-                for feature, layer in features:
-                    geom = feature.geometry()
-                    if geom and geom.isGeosValid():
-                        geom_length = geom.length()
-                        total_length += geom_length
-
-                        for field in layer.fields():
-                            fname = field.name()
-                            if any(fname.startswith(prefix) for prefix in crossing_field_prefixes):
-                                val = feature[fname]
-                                if val is not None and str(val).replace(".", "", 1).isdigit():
-                                    val_float = float(val)
-                                    total_field_length = val_float * geom_length
-                                    # Accumulate total installed length
-                                    field_counter[fname] = field_counter.get(fname, 0) + total_field_length
-                                    # Count how many features had this field > 0
-                                    if val_float > 0:
-                                        field_feature_count[fname] = field_feature_count.get(fname, 0) + 1
-
-
-                # Per-field breakdown
-                html += "<div style='margin-left:10px;'><ul style='margin-top: 4px;'>"
-                plain_text += "Field totals:\n"
-
-                for field_name in sorted(field_counter):
-                    total_installed = round(field_counter[field_name], 2)
-                    count = field_feature_count.get(field_name, 0)
-                    if count != 0:
-                        html += f"<li><b>{field_name}</b><span style='color:#2596be'> ({count}x)</span> <span style='color:#27ae60;'> {total_installed}m</span></li>"
-                        plain_text += f"{field_name}: {count}× totaling {total_installed} m\n"
-                html += "</ul><br>"
-
-
-
-            elif group_name == "trenching":
-
-                trench_field_prefixes = ["db24", "db3_14", "db5_14", "db7_14", "db3_20", "db14", "wachtbuis", "pe",
-
-                                         "db7_gr", "d7_or", "srv", "hdpe"]
-
-                field_counter = {}  # Total installed length per field
-                field_feature_count = {}  # Number of features contributing per field
-                total_length = 0  # Total geometry length of trenching
-                for feature, layer in features:
-                    geom = feature.geometry()
-                    if geom and geom.isGeosValid():
-                        geom_length = geom.length()
-                        total_length += geom_length
-                        for field in layer.fields():
-                            fname = field.name()
-                            if any(fname.startswith(prefix) for prefix in trench_field_prefixes):
-                                val = feature[fname]
-                                if val is not None and str(val).replace(".", "", 1).isdigit():
-                                    val_float = float(val)
-                                    total_field_length = val_float * geom_length
-                                    field_counter[fname] = field_counter.get(fname, 0) + total_field_length
-                                    if val_float > 0:
-                                        field_feature_count[fname] = field_feature_count.get(fname, 0) + 1
-
-                plain_text += f"Total Length: {round(total_length, 2)} m\n"
-
-                html += "<div style='margin-left:10px;'><ul style='margin-top: 4px;'>"
-                plain_text += "Field totals:\n"
-
-                for field_name in sorted(field_counter):
-                    total_installed = round(field_counter[field_name], 2)
-                    count = field_feature_count.get(field_name, 0)
-                    if count != 0:
-                        html += f"<li><b>{field_name}</b><span style='color:#2596be;'> ({count}x)</span> <span style='color:#27ae60;'> {total_installed}m</span></li>"
-                        plain_text += f"{field_name}: {count}× totaling {total_installed} m\n"
-                html += "</ul><br>"
-
-            elif group_name == "accesspoint":
-                materiaal_counter = Counter()
-
-                for feature, layer in features:
-                    for field in layer.fields():
-                        fname = field.name().lower()
-                        if "materiaal" in fname:  # Adjust based on actual field names
-                            val = feature[fname]
-                            if val:
-                                materiaal_counter[str(val)] += 1
-
-                if materiaal_counter:
-                    html += "<div style='margin-left:10px;'><b>Les matériaux:</b><ul style='margin-bottom:10px;'>"
-                    for mat_val, count in materiaal_counter.items():
-                        html += f"<li><b>{mat_val}</b> (<span style='color:#27ae60;'>×{count}</span>)</li>"
-                        plain_text += f"{mat_val} (×{count})\n"
-                    html += "</ul></div>"
-        self.browser.setHtml(html)
-        self.save_text_browser_as_png()
-        self.copy_button.clicked.connect(self.copy_text)
-
-
-
-
         dialog.setLayout(layout)
+
+
+        def copy_text():
+            QApplication.clipboard().setText(plain_text)
+
+        self.copy_button.clicked.connect(copy_text)
+
         dialog.exec_()
+
+    def get_base_table_name(self, layer):
+        uri = layer.dataProvider().dataSourceUri()
+
+        # Extract dbname
+        db_match = re.search(r"dbname='([^']+)'", uri)
+        dbname = db_match.group(1).lower()
+
+        # Extract table name (support multiple URI formats)
+        table_match = re.search(r'table="[^"]+"\."([^"]+)"', uri)
+        if not table_match:
+            table_match = re.search(r'table="([^"]+)"', uri)
+        if not table_match:
+            table_match = re.search(r'table=([^ ]+)', uri)
+        table_name = table_match.group(1).lower() if table_match else "other"
+
+        return dbname, table_name
+
+
+
 
 
