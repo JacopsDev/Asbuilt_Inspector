@@ -170,7 +170,7 @@ class AsbuiltInspector:
         self.icon_inactive = QIcon(icon_path)
 
         # Only add the action once, and keep a reference to it
-        self.inspect_action = QAction(self.icon_inactive, self.tr(u'SABINe-tool'), self.iface.mainWindow())
+        self.inspect_action = QAction(self.icon_inactive, self.tr(u'SABINee-tool'), self.iface.mainWindow())
         self.inspect_action.triggered.connect(self.run)
         self.inspect_action.setCheckable(True)  # optional toggle-style look
 
