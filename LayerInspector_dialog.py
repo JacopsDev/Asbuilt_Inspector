@@ -48,7 +48,7 @@ from qgis.PyQt import QtWidgets
 
 class FeatureSummarizer:
     CROSSING_PREFIXES = ["db24", "db3_14", "db5_14", "db7_14", "db3_20", "db14", "wachtbuis", "pe", "db7_gr", "d7_or"]
-    TRENCHING_PREFIXES = ["db24", "db3_14", "db5_14", "db7_14", "db3_20", "db14", "wachtbuis", "pe", "db7_gr", "db7_or", "srv", "hdpe"]
+    TRENCHING_PREFIXES = ["db24", "db3_14", "db5_14", "db7_14", "db3_20", "db14", "wachtbuis", "pe", "db7_gr", "db7_or", "srv", "hdpe", "db6_magenta"]
 
     TYPE_MAPPING = {
         "accesspoints": "accesspoint",
@@ -72,11 +72,13 @@ class FeatureSummarizer:
     @classmethod
     def determine_group_key(cls, feature, layer):
         dbname, table_name = cls.parse_db_and_table(layer)
-        if dbname == "wyre":
+        project_val = (str(feature["project"]).lower() if "project" in feature.fields().names() else "")
+        if "wyre" in project_val:
             db_group = "wyre"
-        elif dbname == "fiberklaar":
-            project_val = (str(feature["project"]).lower() if "project" in feature.fields().names() else "")
-            db_group = "wyre" if "wyre" in project_val else "fiberklaar"
+        elif "proximus" in project_val:
+            db_group = "proximus"
+        elif "fiberklaar" in project_val:
+            db_group = "fiberklaar"
         else:
             db_group = "other"
         type_key = cls.TYPE_MAPPING.get(table_name, "other")
@@ -168,22 +170,24 @@ class FeatureSummarizer:
             if db_group.lower() == "wyre":
                 header_color = "#27ae60"
                 plugin_dir = os.path.dirname(os.path.abspath(__file__))
-                icon_path = os.path.join(plugin_dir,
-                                         'wyrewyre.png')
+                icon_path = os.path.join(plugin_dir, 'wyrewyre.png')
                 icon_url = icon_path
             elif db_group.lower() == "fiberklaar":
-                header_color = "#2980b9"  # Blue
+                header_color = "#2980b9"
                 plugin_dir = os.path.dirname(os.path.abspath(__file__))
-                icon_path = os.path.join(plugin_dir,
-                                         'fiberfiber.png')
+                icon_path = os.path.join(plugin_dir, 'fiberfiber.png')
+                icon_url = icon_path
+            elif db_group.lower() == "proximus":
+                header_color = "#8e44ad"  # Example: purple
+                plugin_dir = os.path.dirname(os.path.abspath(__file__))
+                icon_path = os.path.join(plugin_dir, 'proximus (1).png')
                 icon_url = icon_path
             else:
                 header_color = "#2c3e50"
-                icon_url = ""  # Optional default or empty
+                icon_url = ""
 
             # Include image next to the title if available
-            img_tag = f"<img src='{icon_url}' style='height:20px; width:40px; vertical-align:middle; margin-right:10px; border-radius:4px;' />" if icon_url else ""
-
+            img_tag = f"<img src='{icon_url}' style='height:20px; width:40px; vertical-align:middle; margin-left:30px; border-radius:4px;' />" if icon_url else ""
             html += f"<h2 style='color:{header_color}; margin-top:20px; height:20px; width:40px;'>{img_tag}</h2>"
             text += f"{db_group.upper()}:\n{'=' * (len(db_group) + 1)}\n"
 
@@ -192,7 +196,6 @@ class FeatureSummarizer:
                 h, t = cls.summarize_accesspoints(type_dict["accesspoint"])
                 html += f"<h3 style='text-decoration: underline; margin-left:5px'>⛘  Accespoints materiaal</h3>{h}"
                 text += f"Accespoints materiaal:\n{t}\n"
-
 
             # CROSSINGS
             if "crossing" in type_dict:
